@@ -115,3 +115,288 @@
   - we’ll introduce a small use case focussed on analyzing user events from our website and explore how we can build a DAG to analyze these events at regular intervals. 
   - Next, we’ll explore ways to make this process more efficient by taking an incremental approach to analyzing our data and how this ties into Airflow’s concept of execution dates.
   - Finally, we’ll finish by showing how we can fill in past gaps in our dataset using backfilling and discussing some important properties of proper Airflow tasks.
+
+```
+from datetime import datetime
+import pandas as pd
+from airflow import DAG
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+
+dag = DAG(
+   dag_id="user_events",
+   start_date=datetime(2015, 6, 1),
+   schedule_interval=None,
+)
+
+fetch_events = BashOperator(
+    task_id="fetch_events",
+    bash_command="curl -o data/events.json https://localhost:5000/events",
+    dag=dag, 
+)
+
+
+def _calculate_stats(input_path, output_path):
+    """Calculates event statistics."""
+    events = pd.read_json(input_path)
+    stats = events.groupby(["date", "user"]).size().reset_index()  
+    stats.to_csv(output_path, index=False)
+
+calculate_stats = PythonOperator(
+   task_id="calculate_stats",
+   python_callable=_calculate_stats,
+   op_kwargs={
+       "input_path": "data/events.json",
+       "output_path": "data/stats.csv",
+   },
+   dag=dag, 
+)
+```
+
+### Running at regular intervals
+- Schedule intervals can be defined using the schedule_interval argument when initializing the DAG.
+- By default, the value of this argument is None, which means that the DAG will not be scheduled and will only be run when triggered manually from the UI or the API.
+
+#### Defining scheduling intervals
+- Airflow provides the convenient macro “@daily” for defining a daily scheduled interval which runs our DAG once every day at midnight:
+
+- For example, say we define our DAG with a start date on the first of January:
+```
+import datetime as dt
+dag = DAG(
+    dag_id="user_events",
+    schedule_interval="@daily", 
+    start_date=dt.datetime(year=2019, month=1, day=1)
+)
+```
+
+- Without an end date, Airflow will (in principle) keep executing our DAG on this daily schedule until the end of time. However, if we already know that our project has a fixed duration, we can tell Airflow to stop running our DAG after a certain date using the `end_date` parameter:
+```
+dag = DAG(
+    dag_id="user_events",
+    schedule_interval="@daily", 
+    start_date=dt.datetime(year=2019, month=1, day=1), 
+    end_date=dt.datetime(year=2019, month=1, day=5),
+)
+```
+
+#### Cron-based intervals
+- To support more complicated scheduling intervals, Airflow allows us to define scheduling intervals using the same syntax as used by cron, a time-based job scheduler used by Unix-like computer operating systems such as macOS and Linux.
+
+```
+# ┌─────── minute (0 - 59)
+# │ ┌────── hour (0 - 23)
+# │ │ ┌───── day of the month (1 - 31)
+# │ │ │ ┌───── month (1 - 12)
+# │ │ │ │ ┌──── day of the week (0 - 6) (Sunday to Saturday; # │ │ │ │ │ 7 is also Sunday on some systems) 
+# * * * * *
+```
+
+-  For example, we can define hourly, daily and weekly intervals using the following cron expressions:
+```
+• 0 * * * * = hourly (running on the hour)
+• 0 0 * * * = daily (running at midnight)
+• 0 0 * * 0 = weekly (running at midnight on Sunday)
+```
+
+-  We can also define more complicated expressions such as the following:
+```
+• 0 0 1 * * = midnight on the first of every month
+• 45 23 * * SAT = 23:45 every Saturday
+```
+
+- we can build expressions that enable running jobs on multiple weekdays or multiple sets of hours during a day:
+```
+• 0 0 * * MON,WED,FRI = run every Monday, Wednesday, Friday at midnight
+• 0 0 * * MON-FRI = run every weekday at midnight
+• 0 0,12 * * * = run every day at 00:00AM and 12:00P.M.
+```
+
+- Airflow also provides support for several macros that represent shorthands for commonly used scheduling intervals.
+
+|Preset|Meaning|
+|------|-------|
+|@once|Schedule once and only once|
+|@hourly|Run once an hour at the beginning of the hour|
+|@daily|Run once a day at midnight|
+|@weekly|Run once a week at midnight on Sunday morning|
+|@monthly|Run once a month at midnight on the first day of the month|
+|@yearly|Run once a year at midnight on January 1|
+
+#### Frequency-based intervals
+- You could write an expression that runs on every 1st, 4th, 7th, etc. day of the month, but this approach would run into problems at the end of the month as the DAG would run consecutively on both the 31st and the 1st of the next month, violating the desired schedule.
+- what if we really want to run our DAG on a three-daily schedule?
+- Airflow also allows you to define scheduling intervals in terms of a relative time interval.
+- To use such a frequency-based schedule, you can pass a “timedelta” instance (from the datetime module in the standard library) as a schedule interval:
+
+```
+from datetime import timedelta 
+
+dag = DAG(
+    dag_id="user_events", 
+    schedule_interval=timedelta(days=3), 
+    start_date=dt.datetime(year=2019, month=1, day=1),
+)
+```
+
+### Processing data incrementally
+
+#### Fetching events incrementally
+- assuming we stuck with the @daily schedule
+- For one, our DAG is downloading and calculating statistics for the entire catalogue of user events every day, which is hardly efficient.
+- Moreover, this process is only downloading events for the past 30 days, which means that we are not building up any history for dates further in the past.
+- One way to solve these issues is to change our DAG to load data in an incremental fashion, in which we only load events from the corresponding day in each schedule interval and only calculate statistics for the new events.
+
+![](.README/90df4456.png)
+
+- We can implement this incremental data fetching in our DAG by changing our bash command to include the two dates:
+
+````
+fetch_events = BashOperator(
+    task_id="fetch_events",
+    bash_command="curl -o data/events.json http://localhost:5000/events?start_date=2019-01-01&end_date=2019-01-02", 
+    dag=dag,
+)
+````
+
+#### Dynamic time references using execution dates
+- **execution_date**: 
+  - which represents the date and time for which our DAG is being executed.
+  - the ```execution_date``` is not a date but a timestamp, which reflects the start time of the schedule interval for which the DAG is being executed.
+- **next_execution_date**:
+  - The end time of the schedule interval is indicated by another parameter.
+- **previous_execution_date**:
+  - describes the start of the previous schedule interval.
+  - it can be useful for performing analyses that contrast data from the current time interval with results from the previous interval.
+  
+```
+fetch_events = BashOperator(
+    task_id="fetch_events",
+    bash_command=("curl -o data/events.json " "http://localhost:5000/events?" "start_date={{execution_date.strftime('%Y-%m-%d')}}&end_date={{next_execution_date.strftime('%Y-%m-%d')}}" ),
+    dag=dag,
+)
+```
+
+- Airflow also provides several short hand parameters for common date formats.
+  - **ds** and **ds_nodash** parameters are different representations of the execution_date, formatted as YYYY-MM-DD and YYYYMMDD respectively.
+  - **next_ds**, **next_ds_nodash**, **prev_ds** and **prev_ds_nodash** provide shorthands for the next and previous execution dates, respectively.
+  
+```
+fetch_events = BashOperator(
+   task_id="fetch_events",
+   bash_command="curl -o data/events.json http://localhost:5000/events?start_date={{ds}}&end_date={{next_ds}}", 
+   dag=dag,
+)
+```
+
+#### Partitioning your data
+- To avoid new task is simply overwriting the result of the previous day, meaning that we are effectively not building up any history.
+- One way to solve this problem is to simply append new events to the events.json file, which would allow us to build up our history in a single JSON file.
+  -  a drawback of this approach is that it requires any downstream processing jobs to load the entire dataset, even if we are only interested in calculating statistics for a given day.
+  -  it also makes this file a single point of failure, by which we may risk losing our entire dataset should this file become lost or corrupted.
+
+```
+fetch_events = BashOperator( 
+    task_id="fetch_events",
+    bash_command="curl -o data/events/{{ds}}.json http://localhost:5000/events?start_date={{ds}}&end_date={{next_ds}}",
+    dag=dag,
+)
+```
+
+- This practice of dividing a dataset into smaller, more manageable pieces is a common strategy in data storage and processing systems. 
+- The practice is commonly referred to as partitioning, with the smaller pieces of a dataset being referred to as partitions.
+- The advantage of partitioning our dataset by execution date becomes evident when we consider the second task in our DAG (calculate_stats), in which we calculate statistics for each day’s worth of user events.
+
+```
+def _calculate_stats(input_path, output_path):
+    """Calculates event statistics."""
+    events = pd.read_json(input_path)
+    stats = events.groupby(["date", "user"]).size().reset_index() 
+    stats.to_csv(output_path, index=False)
+
+calculate_stats = PythonOperator( 
+    task_id="calculate_stats", 
+    python_callable=_calculate_stats, 
+    op_kwargs={
+        "input_path": "data/events.json",
+        "output_path": "data/stats.csv", 
+    },
+    dag=dag, 
+)
+```
+
+```
+def _calculate_stats(**context):
+    """Calculates event statistics."""
+    input_path = context["templates_dict"]["input_path"] 
+    output_path = context["templates_dict"]["output_path"]
+    events = pd.read_json(input_path)
+    stats = events.groupby(["date", "user"]).size().reset_index()
+    stats.to_csv(output_path, index=False)
+    
+    
+calculate_stats = PythonOperator(
+   task_id="calculate_stats",
+   python_callable=_calculate_stats,
+   templates_dict={
+       "input_path": "data/events/{{ds}}.json",
+       "output_path": "data/stats/{{ds}}.csv",
+   },
+   provide_context=True, 
+   dag=dag,
+)
+```
+
+#### Using backfilling to fill in past gaps
+- By default, Airflow will schedule and run any past schedule intervals that have not yet been run.
+- Specifying a past start date and activating the corresponding DAG will result in all intervals that have passed before the current time being executed.
+- This behaviour is controlled by the DAG catchup parameter and can be disabled by setting **catchup** to False:
+
+```
+dag = DAG(
+    dag_id="user_events", 
+    schedule_interval=timedelta(days=3), 
+    start_date=dt.datetime(year=2019, month=1, day=1), 
+    catchup=False,
+)
+```
+
+- Although backfilling is a powerful concept, it is limited by the availability of data in source systems. 
+
+### Best Practices for Designing Tasks
+
+#### Atomicity
+- A Sending an email after writing to CSV creates two pieces of work in a single function, which breaks atomicity of the task.
+- To implement this functionality in an atomic fashion, we could simply split the email functionality out into a separate task:
+
+```
+def _send_stats(email, **context):
+    stats = pd.read_csv(context["templates_dict"]["stats_path"]) 
+    email_stats(stats, email=email)
+    
+send_stats = PythonOperator(
+    task_id="send_stats",
+    python_callable=_send_stats,
+    op_kwargs={"email": "user@example.com"},
+    templates_dict={"stats_path": "data/stats/{{ds}}.csv"},
+    provide_context=True,
+    dag=dag, 
+)
+```
+
+#### Idempotency
+- Tasks are said to be idempotent if calling the same task multiple times with the same inputs has no additional effect.
+
+```
+fetch_events = BashOperator( 
+    task_id="fetch_events",
+    bash_command="curl -o data/events/{{ds}}.json http://localhost:5000/events?start_date={{ds}}&end_date={{next_ds}}",
+    dag=dag,
+)
+```
+
+- Re-running this task for a given date would result in the task fetching the same set of events as its previous execution.
+- overwrite the existing JSON file in the data/events folder, producing the same end result.
+
+- an example of a non-idempotent task, consider the situation in which we discussed using a single JSON file (data/events.json) and simply appending events to this file.
+
