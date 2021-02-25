@@ -400,3 +400,85 @@ fetch_events = BashOperator(
 
 - an example of a non-idempotent task, consider the situation in which we discussed using a single JSON file (data/events.json) and simply appending events to this file.
 
+## Templating Tasks Using the Airflow Context
+
+### Inspecting data for processing with Airflow
+-  For the purposes of this example, we will apply the axiom that an increase in a company’s pageviews shows a positive sentiment, and the company’s stock is likely to increase as well.
+-  On the other hand, a decrease in page views tells us a loss in interest, and the stock price is likely to decrease.
+
+#### Determining how to load incremental data
+- In order to develop a data pipeline, we must understand how to load it in an incremental fashion and how to work the data:
+
+- Data Source: ```https://dumps.wikimedia.org/other/pageviews/2019/2019-07/pageviews-20190701-010000.gz```
+
+#### Task context & Jinja templating
+- The url is constructed of various date & time components:  ```https://dumps.wikimedia.org/other/pageviews/{year}/{year}-{month}/pageviews-{year}{month}{day}-{hour}0000.gz```
+
+- Bash Operator
+  - Bash Command:
+    ```curl -o /tmp/wikipageviews.gz https://dumps.wikimedia.org/other/pageviews/{{ execution_date.year }}/{{ execution_date.year }}-{{ '{:02}'.format(execution_date.month) }}/pageviews-{{ execution_date.year }}{{ '{:02}'.format(execution_date.month) }}{{ '{:02}'.format(execution_date.day) }}-{{ '{:02}'.format(execution_date.hour) }}0000.gz```
+  
+  - The double curly braces denote a Jinja templated string. Jinja is a templating engine, which replaces variables and/or expressions in a templated string at runtime.  
+    ```{{ '{:02}'.format(execution_date.hour) }}```
+ 
+- Python Operator
+  - The PythonOperator is an exception to this standard, because it doesn’t take arguments which can be templated with the runtime context, but instead a **python_callable** argument in which the runtime context can be applied.
+    - Way 1: retrieve args in method parameters
+    ```
+        def _get_data(execution_date, **_):
+         year, month, day, hour, *_ = execution_date.timetuple()
+         url = (
+             "https://dumps.wikimedia.org/other/pageviews/"
+            f"{year}/{year}-{month:02}/pageviews-{year}{month:02}{day:02}-{hour:02}0000.gz" )
+        
+         output_path = "/tmp/wikipageviews.gz" 
+         request.urlretrieve(url, output_path)
+    ```
+  - A Keyword arguments can be captured with two asterisks (**). A convention is to name the “capturing” argument kwargs.  
+  - Print start and end date of interval
+    - Way 2: Retrieve args in method body
+    ```
+        def _print_context(**context):
+         start = context["execution_date"] 
+         end = context["next_execution_date"]
+         print(f"Start: {start}, end: {end}")
+    ```
+    
+  - Providing user-defined variables to the PythonOperator callable
+      ```
+      get_data = PythonOperator( 
+        task_id="get_data", 
+        python_callable=_get_data, 
+        provide_context=True, 
+        op_args=["/tmp/wikipageviews.gz"], #or op_kwargs={"output_path": "/tmp/wikipageviews.gz"},
+        dag=dag,
+      )
+      ```
+   - **output_path** in can be the first argument in the **_get_data** function, the value of it will be set to **“/tmp/wikipageviews.gz”**.
+    
+
+### Hooking up other systems
+- two operators will extract the archive and process the extracted file by scanning over it and selecting the pageview counts for the given page names.
+
+- CREATE TABLE statement for storing output
+  
+  ```
+  CREATE TABLE pageview_counts (
+      pagename VARCHAR(50) NOT NULL,
+      pageviewcount INT NOT NULL,
+      datetime TIMESTAMP NOT NULL
+  );
+  ```    
+  
+- Postgres is an external system and Airflow supports connecting to a wide range of external systems with the help of many operators in the Airflow ecosystem.
+  - ```pip3.9 install apache-airflow[postgres]```
+
+  - ```
+        airflow connections --add 
+        --conn_id my_postgres   <- connection identifier
+        --conn_type postgres
+        --conn_host localhost
+        --conn_login postgres
+        --conn_password mysecretpassword
+    ```
+    
