@@ -481,4 +481,200 @@ fetch_events = BashOperator(
         --conn_login postgres
         --conn_password mysecretpassword
     ```
-    
+## Complex task dependencies
+
+### Basic dependencies
+#### Linear dependencies
+```
+download_launches = BashOperator(...)
+get_pictures = PythonOperator(...)
+notify = BashOperator(...)
+```  
+#### Fan in/out dependencies
+```
+# Fan out (one-to-multiple).
+start >> [fetch_weather, fetch_sales]
+# Note that this is equivalent to:
+# start >> fetch_weather
+# start >> fetch_sales
+```
+```
+# Fan in (multiple-to-one), defined in one go.
+[preprocess_weather, preprocess_sales] >> build_dataset
+# This notation is equivalent to defining the
+# two dependencies in two separate statements:
+preprocess_weather >> build_dataset
+preprocess_sales >> build_dataset
+```
+```
+# Remaining steps are a single linear chain.
+build_dataset >> train_model >> notify
+```
+
+### Branching
+
+#### Branching within tasks
+```
+def _preprocess_sales(**context):
+    if context['execution_date'] < ERP_CHANGE_DATE:
+        _preprocess_sales_old(**context)
+    else
+        _preprocess_sales_new(**context)
+...
+preprocess_sales_data = PythonOperator(
+    task_id="preprocess_sales",
+    python_callable=_preprocess_sales,
+    provide_context=True
+)
+```  
+#### Branching within the DAG
+- Building the two sets of tasks is relatively straight-forward: we can simply create tasks for each ERP system separately using the appropriate operators and link the respective tasks together:
+```
+fetch_sales_old = PythonOperator(...)
+preprocess_sales_old = PythonOperator(...)
+
+fetch_sales_new = PythonOperator(...)
+preprocess_sales_new = PythonOperator(...)
+
+fetch_sales_old >> preprocess_sales_old
+fetch_sales_new >> preprocess_sales_new
+```
+
+- Fortunately, Airflow provides built-in support for choosing between sets of downstream tasks using the **BranchPythonOperator**.
+
+```
+def _pick_erp_system(**context):
+   ...
+   
+sales_branch = BranchPythonOperator(
+    task_id='sales_branch',
+    provide_context=True,
+    python_callable=_pick_erp_system,
+)
+```
+
+- we can implement our choice between the two ERP systems by using the callable to return the appropriate task_id depending on the execution date of the DAG:
+```
+def _pick_erp_system(**context):
+   if context["execution_date"] < ERP_SWITCH_DATE:
+        return "fetch_sales_old"
+    else:
+        return "fetch_sales_new"
+
+sales_branch = BranchPythonOperator(
+       task_id='sales_branch',
+       provide_context=True,
+       python_callable=_pick_erp_system,
+)
+
+sales_branch >> [fetch_sales_old, fetch_sales_new]
+start_task >> sales_branch
+[preprocess_sales_old, preprocess_sales_new] >> build_dataset
+
+```
+
+- Trigger rules can be defined for individual tasks using the `trigger_rule` argument, which can be passed to any operator.
+- By default, trigger rules are set to `all_success`, meaning that all parents of the corresponding task need to succeed before the task can be run.
+- we can change the trigger rule of build_dataset so that it can still trigger if one of its upstream tasks is skipped. One way to achieve this is to change the trigger rule to `none_failed`, which specifies that a task should run as soon as all of its parents are done with executing and none have failed:
+```
+build_dataset = PythonOperator(
+    ...,
+    trigger_rule="none_failed",
+)
+```
+
+- One drawback of this approach is that we now have three edges going into build_dataset. This doesn’t really reflect the nature of our flow, in which we essentially want to fetch sales/weather data (choosing between the two ERP systems first) and then feed these two data sources into build_dataset. For this reason, many people choose to make the branch condition more explicit by adding a dummy task joining the different branches before continuing with the DAG 
+
+![](.README/349eed2e.png)
+
+```
+from airflow.operators.dummy_operator import DummyOperator
+join_branch = DummyOperator(
+    task_id="join_erp_branch",
+    trigger_rule="none_failed"
+)
+
+[preprocess_sales_old, preprocess_sales_new] >> join_branch
+join_branch >> build_dataset
+```
+
+
+### Conditional tasks
+
+- Besides branches, Airflow also provides you with other mechanisms for skipping specific tasks in your DAG depending on certain conditions.
+- One way to make conditional notifications is to implement the notification using the PythonOperator and to explicitly check the execution date of the DAG within the notification function:
+```
+def _notify(**context):
+    if context["execution_date"] == ...:
+        send_notification()
+
+notify = PythonOperator(
+    task_id="notify",
+    python_callable=_notify,
+    provide_context=True
+)
+```
+- Drawback: the corresponding branching implementation: it confounds the notification logic with the condition, we can no longer use specialised operators (such as a SlackOperator, for example) and tracking of task results in the Airflow UI becomes less explicit 
+
+- Another way to implement conditional notifications is to make the notification task itself conditional, meaning that the actual notification task is only executed based on a predefined condition (in this case whether the DAG run is the most recent DAG run).
+
+```
+def _latest_only(**context):
+    ...
+if_most_recent = PythonOperator(
+    task_id="latest_only",
+    python_callable=_latest_only,
+    provide_context=True,
+    dag=dag,
+)
+if_most_recent >> notify
+```
+
+- we need to fill in our _latest_only function to make sure that downstream tasks are skipped if the execution_date does not belong to the most recent run. To do so, we need to 
+  - (a) check our execution date and, if required, 
+  - (b) raise an AirflowSkipException from our function, which is Airflow’s way of allowing us to indicate that the condition and all its downstream tasks should be skipped, thus skipping the notification.
+
+```
+from airflow.exceptions import AirflowSkipException
+
+def _latest_only(**context):
+     # Find the boundaries for our execution window.
+       left_window = context['dag'].following_schedule(context['execution_date'])
+       right_window = context['dag'].following_schedule(left_window)
+       
+     # Check if our current time is within the window.
+     now = pendulum.utcnow()
+       if not left_window < now <= right_window:
+           raise AirflowSkipException("Not the most recent run!")
+```  
+
+- As this is a common use case, Airflow also provides the built-in `LatestOnlyOperator` class, which performs the same task as our custom built implementation based on the PythonOperator.
+
+```
+from airflow.operators.latest_only_operator import LatestOnlyOperator
+
+latest_only = LatestOnlyOperator(
+    task_id='latest_only',
+    dag=dag, 
+)
+
+train_model >> if_most_recent >> notify
+```
+
+### More about trigger rules
+#### What is a trigger rule?
+- Trigger rules are essentially the conditions that Airflow applies to tasks to determine whether they are ready to execute, as a function of their dependencies (= preceding tasks in the DAG).
+- Airflows default trigger rule is “all_success”, which states that all of a tasks dependencies must have completed successfully before the task itself can be executed.
+
+#### Other trigger rules
+
+|Trigger rule|Behaviour|Example use case|
+|------------|---------|----------------|
+|all_success (default)|Triggers when all parent tasks have completed successfully.|The default trigger rule for a normal workflow.|
+|all_failed|Triggers when all parent tasks have failed (or have failed as a result of a failure in their parents).|Trigger error handling code in situations where you expected at least one success amongst a group of tasks.|
+|all_done|Triggers when all parents are done with their execution, regardless of the their resulting state.|Execute clean-up code that you want to execute when all tasks have finished (e.g. shutting down a machine or stopping a cluster).|
+|one_failed|Triggers as soon as at least one parent has failed, does not wait for other parent tasks to finish executing.|Quickly trigger some error handling code, such as notifications or rollbacks.|
+|one_success|Triggers as soon as one parent succeeds, does not wait for other parent tasks to finish executing.|Quickly trigger downstream computations/notifications as soon as one result becomes available.|
+|none_failed|Triggers if no parents have failed, but have either completed successfully or been skipped.|Joining conditional branches in Airflow DAGs|
+|none_skipped|Triggers if no parents have been skipped, but have either completed successfully or failed.|?|
+|dummy|Triggers regardless of the state of any upstream tasks.|Used for internal testing by Airflow.|
