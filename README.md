@@ -678,3 +678,83 @@ train_model >> if_most_recent >> notify
 |none_failed|Triggers if no parents have failed, but have either completed successfully or been skipped.|Joining conditional branches in Airflow DAGs|
 |none_skipped|Triggers if no parents have been skipped, but have either completed successfully or failed.|?|
 |dummy|Triggers regardless of the state of any upstream tasks.|Used for internal testing by Airflow.|
+
+
+## Triggering workflows
+
+### Polling conditions with sensors
+- One common use case to start a workflow is the arrival of new data - imagine a third party delivering a daily dump of its data on a shared storage system between your company and the third party. 
+- the daily data often arrives at random times.
+- **One way** to solve this in Airflow is with the help of sensors, which are a special type (subclass) of operators. Sensors continuously poll for certain conditions to be true, and succeed if so. If false, the sensor will wait and try again until either the condition is true, or a timeout is eventually reached:
+```
+from airflow.contrib.sensors.file_sensor import FileSensor
+
+wait_for_supermarket_1 = FileSensor( 
+    task_id="wait_for_supermarket_1",
+    filepath="/data/supermarket1/data.csv", 
+)
+```
+- This **FileSensor** will check for the existence of /data/supermarket1/data.csv and return True if the file exists. 
+- If not, it returns False and the sensor will wait for a given period (default 60 seconds) and try again.
+
+#### Polling custom conditions
+- Airflow’s FileSensor does support wildcards to match e.g. data- *.csv, this will match any file matching the pattern.
+- Under the hood the FileSensor uses globbing18 to match patterns against file or directory names. While globbing (similar to regex, yet more limited in functionality) would be able to match multiple patterns with a complex pattern, a more readable approach is to implement the two checks with the PythonSensor.
+- The PythonSensor is similar to the PythonOperator in the sense that you supply a Python callable (function/method/etc.) to execute.
+- The PythonSensor callable is however limited to returning a boolean value; True to indicate the condition is met successfully, False to indicate it is not.
+
+```
+from pathlib import Path
+
+from airflow.contrib.sensors.python_sensor import PythonSensor
+
+def _wait_for_supermarket(supermarket_id): 
+    supermarket_path = Path("/data/" + supermarket_id) 
+    data_files = supermarket_path.glob("data-*.csv") 
+    success_file = supermarket_path / "_SUCCESS" 
+    return data_files and success_file.exists()
+
+wait_for_supermarket_1 = PythonSensor( 
+    task_id="wait_for_supermarket_1", 
+    python_callable=_wait_for_supermarket, 
+    op_kwargs={"supermarket_id": "supermarket1"}, 
+    dag=dag,
+)                   
+```
+
+- The DAG class has a **concurrency** argument which controls how many simultaneously running tasks are allowed within that DAG.
+- In case of error like:
+  - ``` occupying 16 tasks, 2 new tasks cannot run, and any other task trying to run is blocked```
+  - This behaviour is often referred to as **“sensor deadlock”**.
+  - The maximum number of running tasks in the DAG is reached and thus the impact is limited to that DAG, while other DAGs can still run.
+  - Once the global Airflow limit of maximum tasks is reached, your entire system is stalled which is obviously very undesirable!
+- Solution:
+  - The Sensor class takes an argument mode, which can be set to either **“poke”** or **“reschedule”**.
+  - By default it’s set to **“poke”**, leading to the blocking behaviour.
+    - the sensor task occupies a task slot as long as it’s running. Once in a while it pokes the condition, and then does nothing but still occupies a task slot.
+  - The sensor **“reschedule”** mode releases the slot after it has finished poking, so it only occupies the slots while it’s doing actual work. 
+  
+### Triggering other DAGs
+- Splitting your DAG into multiple smaller DAGs where each DAG takes care of part of the total workflow.
+- This scenario can be achieved with the **TriggerDagRunOperator**. This operator allows triggering other DAGs, which you can apply for decoupling parts of a workflow:
+
+![](.README/051593ac.png)
+
+- The string provided to the **trigger_dag_id** argument of the **TriggerDagRunOperator** must match the **dag_id** of the DAG to trigger.
+
+#### Backfilling with the TriggerDagRunOperator
+- What if you changed some logic in the process_* tasks and wanted to re-run the DAGs from there on ?
+  - In a single DAG you could clear the state of the process_* and corresponding downstream tasks.
+  - clearing tasks **only** clears tasks within the same DAG! 
+  - Tasks downstream of a **TriggerDagRunOperator** in another DAG are not cleared so be well aware of this behaviour.
+  
+### Starting workflows with REST/CLI
+- Using the Airflow CLI, we can trigger a DAG as follows:
+  - ```airflow trigger_dag dag1```  or ```airflow dags trigger dag1```
+- Passing context variable in DAG
+  - ```airflow trigger_dag dag1 -c ‘{“supermarket_id”: 1}’```
+  
+- It is also possible to use the REST API for the same result,
+  - ```curl localhost:8080/api/experimental/dags/print_dag_run_conf/dag_runs -d {}``` or
+  - ```curl localhost:8080/api/experimental/dags/print_dag_run_conf/dag_runs -d '{"conf":{"supermarket": 1}}'```
+  
